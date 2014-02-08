@@ -31,12 +31,12 @@ from collections import OrderedDict
 from itertools import islice
 
 
-def selectPackages(cache, packages):
+def selectPackages(packages, cache):
     res = list()
 
     for k, v in packages.items():
         if not v:
-            cache[k] = v
+            cache[k] = False
         else:
             res.append(k)
 
@@ -237,7 +237,7 @@ def main():
 
     userSelection(packages, issues)
 
-    cache, res = selectPackages(cache, packages)
+    cache, res = selectPackages(packages, cache)
     saveCache(cache)
     doUpdate(res, conf)
 
