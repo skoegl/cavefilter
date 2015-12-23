@@ -20,228 +20,306 @@
 
 import argparse
 import configparser
-import sys
+import os
+import os.path
+import pickle
 import re
 import subprocess
-import os.path
-import os
-import shutil
-
+import sys
 from collections import OrderedDict
 from itertools import islice
 
 
-def selectPackages(packages, cache):
-    res = list()
+class CaveFilter(object):
+	def __init__(self, args):
+		super(CaveFilter, self).__init__()
+		self.args = args
+		self.cache_dir = os.path.expanduser("~/.cache")
+		self.config_dir = os.path.expanduser("~/.config")
+		self.config_path = os.path.join(self.config_dir, "cavefilter.conf")
+		self.cache_path = os.path.join(self.cache_dir, "cavefilter.cache")
+		self.selection_path = os.path.join(self.cache_dir,
+		                                   "cavefilter.selection")
+		self.cache = dict()
+		self.config = None
+		self.packages = OrderedDict()
+		self.result = list()
+		self.issues = OrderedDict()
+		self.type_db = dict()
 
-    for k, v in packages.items():
-        if not v:
-            cache[k] = False
-        else:
-            res.append(k)
+		self.check_dirs()
+		self.load_cache()
+		self.apply_cache()
 
-    return cache, res
+	def start(self):
+		self.loadConfig()
 
+		if not self.args.retry:
+			self.doFreshRun()
+		else:
+			self.loadSelection()
 
-def saveCache(cache):
-    with open(os.path.expanduser("~/.cache/cave_output_filter"), "w") as cacheigfile:
-        cacheigfile.write("\n".join(["%s = %s" % (k, v) for k, v in cache.items()]) + "\n")
+		self.userSelection()
 
+		self.selectPackages()
+		self.saveSelection()
+		self.saveCacheNew()
+		self.doUpdate()
 
-def loadConfig():
-    if os.path.isfile(os.path.expanduser("~/.config/cave_output_filter.cfg")):
-        path = os.path.expanduser("~/.config/cave_output_filter.cfg")
-    else:
-        if not os.path.isfile("/etc/cave_output_filter.cfg"):
-            print("Error: cannot find config file:", file=sys.stderr)
-            print("Error: searched in %r and %r" % (os.path.expanduser("~/.config/cave_output_filter.cfg"), "/etc/cave_output_filter.cfg"), file=sys.stderr)
-            sys.exit(-1)
-        path = "/etc/cave_output_filter.cfg"
+	def check_dirs(self):
 
-    print("using config file %s:" % path)
-    conf = configparser.SafeConfigParser()
-    conf.read(path)
-    print("Search flags: %s" % conf.get("main", "search_flags"))
-    print("Install flags: %s" % conf.get("main", "install_flags"))
-    return conf
+		if not os.path.isdir(self.cache_dir):
+			os.mkdir(self.cache_dir, mode=0o700)
 
+		if not os.path.isdir(self.config_dir):
+			os.mkdir(self.config_dir, mode=0o700)
 
-def applyCache(packages, args):
-    """filters packages based on cached package selection from last run.
+	def load_cache(self):
+		with open(self.cache_path, "rb") as cache_file:
+			self.cache = pickle.load(cache_file)
 
-    The cache is saved under "~/.cache/cave_output_filter"
-    """
+	def apply_cache(self):
+		"""filters packages based on cached package selection from last run.
 
-    cache = dict()
-    if args.no_cache:
-        return cache
+		The cache is saved under "~/.cache/cave_output_filter"
+		"""
 
-    if not os.path.isdir(os.path.expanduser("~/.cache")):
-        os.mkdir(os.path.expanduser("~/.cache"), mode=0o700)
+		for key, value in self.cache.items():
+			if key in self.packages:
+				self.packages[key] = False
 
-    real_path = os.path.expanduser("~/.cache/cave_output_filter")
-    if not os.path.isfile(real_path):
-        print("Info: no cache file found in %s" % real_path)
-        return cache
+	def saveCacheNew(self):
+		with open(self.cache_path, "wb") as cache_file:
+			pickle.dump(self.cache, cache_file, pickle.HIGHEST_PROTOCOL)
 
-    lines = open(real_path).readlines()
-    for line in lines:
-        try:
-            key, value = line.split(" = ")
-            if key in packages:
-                packages[key] = False
-            cache[key] = False
-        except ValueError:
-            pass
+	def saveSelection(self):
+		tmp = [self.packages, self.issues, self.result, self.type_db]
+		with open(self.selection_path, "wb") as selection_file:
+			pickle.dump(tmp, selection_file)
 
-    return cache
+	def loadSelection(self):
+		try:
+			with open(self.selection_path, "rb") as selection_file:
+				data = pickle.load(selection_file)
+				self.packages, self.issues, self.result, self.type_db = data
+		except ValueError:
+			pass
 
+	def loadConfig(self):
+		self.config = configparser.ConfigParser()
+		self.config.read(self.config_path)
 
-def invertSelection(packages):
-    for k, v in packages.items():
-        packages[k] = not v
+	def selectPackages(self):
+		self.result.clear()
+		for k, v in self.packages.items():
+			if not v:
+				self.cache[k] = False
+			else:
+				self.result.append(k)
 
+	def doFreshRun(self):
+		self.checkResume()  # perhaps we're done here
+		self.doSync()
 
-def invertSelectionRange(packages, begin, end):
-    for k, v in islice(packages.items(), begin, end):
-        packages[k] = not v
+		outs, errs = self.getUpdates()
+		self.getPackages(outs, self.packages)
+		self.getPackages(errs, self.issues)
 
+	def getUpdates(self):
+		query = 'cave resolve %s %s' % (
+			self.args.target, self.config.get("main", "search_flags"))
+		print("Emitting: %s" % query)
+		query_proc = subprocess.Popen(query, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		outs, errs = query_proc.communicate()
+		packages_text, other = outs.decode("UTF-8").split("Total: ")
+		packages_text = packages_text.strip()
+		try:
+			dust, error_text = other.split("I cannot proceed without being permitted to do the following:")
+			error_text = error_text
+		except ValueError:
+			error_text = ""
+		return packages_text, error_text
 
-def invertPrefix(packages, prefix):
-    for k, v in packages.items():
-        if k.startswith(prefix):
-            packages[k] = not v
+	def invertSelection(self):
+		for k, v in self.packages.items():
+			self.packages[k] = not v
 
+	def toggle_packages(self):
+		for k, v in self.packages.items():
+			self.packages[k] = False
 
-def getPackages(data):
-    packages = OrderedDict()
-    for txt in data.split("\n"):
-        m1 = re.match("[urdn]   (.*?)/(.*?):(.*?)::(.*?)(?: \(formerly from .*?\))? (.*?) .*", txt)
-        if m1:
-            packages[m1.group(1) + "/" + m1.group(2) + "-" + m1.group(5) + "::" + m1.group(4)] = True
-    return packages
+	def toggle_updates(self):
+		for k, v in self.type_db.items():
+			if v == "u":
+				self.packages[k] = not self.packages[k]
 
+	def toggle_downgrades(self):
+		for k, v in self.type_db.items():
+			if v == "d":
+				self.packages[k] = not self.packages[k]
 
-def getUpdates(conf, args):
-    query = 'cave resolve -c %s %s' % (args.target, conf.get("main", "search_flags"))
-    print("Emitting: %s" % query)
-    query_proc = subprocess.Popen(query, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    outs, errs = query_proc.communicate()
-    packages_text, other = outs.decode("UTF-8").split("Total: ")
-    packages_text = packages_text.strip()
-    try:
-        dust, error_text = other.split("I cannot proceed without being permitted to do the following:")
-        error_text = error_text
-    except ValueError:
-        error_text = ""
-    return packages_text, error_text
+	def toggle_rebuilds(self):
+		for k, v in self.type_db.items():
+			if v == "r":
+				self.packages[k] = not self.packages[k]
 
+	def toggle_new(self):
+		for k, v in self.type_db.items():
+			if v == "n":
+				self.packages[k] = not self.packages[k]
 
-def userSelection(packages, issues):
-    count_map = dict()
-    for ix, i in enumerate(packages.keys()):
-        count_map[ix] = i
+	def invertSelectionRange(self, begin, end):
+		for k, v in islice(self.packages.items(), begin, end):
+			self.packages[k] = not v
 
-    usage_text = "    Choose one of the following operations:\n" \
-        "    int: inverts the specified package with number int\n" \
-        "    int-int: inverts the specified package range from int till int\n" \
-        "    -1: inverts all packages\n" \
-        "    0: start\n" \
-        "    q: exit\n" \
-        "    sometext: inverts all packages starting with sometext\n"
+	def invertPrefix(self, prefix):
+		for k, v in self.packages.items():
+			if k.startswith(prefix):
+				self.packages[k] = not v
 
-    while 1:
-        ip = input("\n".join(["%s %s: %s%s" % ((i[1] and "[x]" or "").rjust(4), str(ix+1).rjust(5), i[0], i[0] in issues and " (!!!)" or "") for ix, i in enumerate(packages.items())]) + "\n\n" + usage_text)
-        try:
-            num = int(ip)
-            if num == 0:
-                break
-            elif num == -1:
-                invertSelection(packages)
-            else:
-                try:
-                    k = count_map[num-1]
-                    packages[k] = not packages[k]
-                except IndexError as e:
-                    pass
-        except ValueError as e:
-            if ip == "q":
-                sys.exit(0)
-            else:
-                try:
-                    begin, end = ip.split("-", 1)
-                    begin = int(begin) - 1
-                    end = int(end)
-                    invertSelectionRange(packages, begin, end)
-                except ValueError:
-                    pass
-                invertPrefix(packages, ip)
+	def match_packages(self, regex, type_id, line, packages):
+		matched = regex.match(line)
+		if matched:
+			package = matched.group(1) + "/" + matched.group(2) + "-" + \
+			          matched.group(5) + "::" + matched.group(4)
+			packages[package] = True
+			self.type_db[package] = type_id
 
+	def getPackages(self, data, packages):
 
-def doUpdate(res, conf):
+		update_regex = re.compile("u   (.*?)/(.*?):(.*?)::(.*?)(?: \("
+		                          "formerly from .*?\))? (.*?) .*")
+		rebuild_regex = re.compile("r   (.*?)/(.*?):(.*?)::(.*?)(?: \("
+		                           "formerly from .*?\))? (.*?) .*")
+		downgrade_regex = re.compile("d   (.*?)/(.*?):(.*?)::(.*?)(?: \("
+		                             "formerly from .*?\))? (.*?) .*")
+		new_regex = re.compile("n   (.*?)/(.*?):(.*?)::(.*?)(?: \("
+		                       "formerly from .*?\))? (.*?) .*")
+		lines = data.split("\n")
+		for line in lines:
+			self.match_packages(update_regex, "u", line, packages)
+			self.match_packages(rebuild_regex, "r", line, packages)
+			self.match_packages(downgrade_regex, "d", line, packages)
+			self.match_packages(new_regex, "n", line, packages)
 
-    cmd_args = "/usr/bin/cave resolve %s %s" % (conf.get("main", "install_flags"), " ".join(["'=%s'" % i for i in res]))
-    print("Emitting: %s" % cmd_args)
-    try:
-        query_proc = subprocess.Popen(cmd_args, shell=True)
-        query_proc.communicate()
-        sys.exit(0)
-    except Exception:
-        pass
+	def create_item(self, selected, index, package, issue, type_id):
+		return "%s %s: %s%s [%s]" % (selected, index, package, issue, type_id)
 
+	def create_menu(self):
+		out = list()
+		for ix, i in enumerate(self.packages.items()):
+			out.append(self.create_item(
+					(i[1] and "[x]" or "").rjust(4),
+					str(ix + 1).rjust(5),
+					i[0], i[0] in
+					      self.issues and " (!!!)" or "",
+					self.type_db[i[0]]))
+		return "\n".join(out)
 
-def checkResume(args):
-    if args.ignore_resume:
-        try:
-            os.remove("cave.resume")
-        except OSError:
-            pass
+	def userSelection(self):
+		count_map = dict()
+		for ix, i in enumerate(self.packages.keys()):
+			count_map[ix] = i
 
-    if os.path.isfile("cave.resume"):
-        query = 'cave resume -rR -Ca --resume-file cave.resume'
-        query_proc = subprocess.Popen(query, shell=True)
-        query_proc.communicate()
-        sys.exit(0)
+		usage_text = "    Choose one of the following operations:\n" \
+		             "    int: inverts the specified package with number int\n" \
+		             "    int-int: inverts the specified package range from int till int\n" \
+		             "    -1: inverts all packages\n" \
+		             "    0: start\n" \
+		             "    q: exit\n" \
+		             "    sometext: inverts all packages starting with sometext\n"
 
+		while 1:
+			ip = input("%s\n\n%s" % (self.create_menu(), usage_text))
+			try:
+				num = int(ip)
+				if num == 0:
+					break
+				elif num == -1:
+					self.invertSelection()
+				else:
+					try:
+						k = count_map[num - 1]
+					except KeyError:
+						continue
+					try:
+						self.packages[k] = not self.packages[k]
+					except IndexError as e:
+						continue
+			except ValueError as e:
+				if ip == "q":
+					sys.exit(0)
+				elif ip == "t":
+					self.toggle_packages()
+				elif ip == "u":
+					self.toggle_updates()
+				elif ip == "r":
+					self.toggle_rebuilds()
+				elif ip == "d":
+					self.toggle_downgrades()
+				elif ip == "n":
+					self.toggle_new()
+				else:
+					try:
+						begin, end = ip.split("-", 1)
+						begin = int(begin) - 1
+						end = int(end)
+						self.invertSelectionRange(begin, end)
+					except ValueError:
+						pass
+						self.invertPrefix(ip)
 
-def doSync(args):
-    if args.sync:
-        sync_proc = subprocess.Popen("cave sync", shell=True)
-        sync_proc.communicate()
+	def doUpdate(self):
 
+		cmd_args = "/usr/bin/cave resolve %s %s" % (self.config.get("main",
+		                                                            "install_flags"),
+		                                            " ".join(["'=%s'" % i for i in self.result]))
+		print("Emitting: %s" % cmd_args)
+		try:
+			query_proc = subprocess.Popen(cmd_args, shell=True)
+			query_proc.communicate()
+			sys.exit(0)
+		except Exception:
+			pass
+
+	def checkResume(self):
+		if self.args.ignore_resume:
+			try:
+				os.remove("cave.resume")
+			except OSError:
+				pass
+
+		if os.path.isfile("cave.resume"):
+			query = 'cave resume -rR -Ca --resume-file cave.resume'
+			query_proc = subprocess.Popen(query, shell=True)
+			query_proc.communicate()
+			sys.exit(0)
+
+	def doSync(self):
+		if self.args.sync:
+			sync_proc = subprocess.Popen("cave sync", shell=True)
+			sync_proc.communicate()
 
 
 def main():
-    parser = argparse.ArgumentParser()
+	parser = argparse.ArgumentParser()
 
-    parser.add_argument('-s', "--sync", action="store_true",
-        default=False, help="sync repos")
-    parser.add_argument('-n', "--no-cache", action="store_true",
-        default=False, help="ignore cave_filter's package selection cache")
-    parser.add_argument('-i', "--ignore_resume", action="store_true",
-        default=False, help="ignore cave resume file")
-    parser.add_argument("-t", '--target',
-        default="world", help="target to resolve, default=world")
+	parser.add_argument('-s', "--sync", action="store_true",
+	                    default=False, help="sync repos")
+	parser.add_argument('-n', "--no-cache", action="store_true",
+	                    default=False, help="ignore cave_filter's package selection cache")
+	parser.add_argument('-r', "--retry", action="store_true",
+	                    default=False, help="retry selection")
+	parser.add_argument('-i', "--ignore_resume", action="store_true",
+	                    default=False, help="ignore cave resume file")
+	parser.add_argument("-t", '--target',
+	                    default="world", help="target to resolve, default=world")
 
-    args = parser.parse_args(sys.argv[1:])
+	args = parser.parse_args(sys.argv[1:])
 
-    checkResume(args) #perhaps we're done here
-    doSync(args)
-
-    conf = loadConfig()
-    outs, errs = getUpdates(conf, args)
-    packages = getPackages(outs)
-    issues = getPackages(errs)
-
-    cache = applyCache(packages, args)
-
-    userSelection(packages, issues)
-
-    cache, res = selectPackages(packages, cache)
-    saveCache(cache)
-    doUpdate(res, conf)
-
+	cavefilter = CaveFilter(args)
+	cavefilter.start()
 
 
 if __name__ == '__main__':
-    main()
+	main()

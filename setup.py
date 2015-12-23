@@ -1,18 +1,7 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-from distribute_setup import use_setuptools
-use_setuptools()
-
-import sys
 from setuptools import find_packages, setup
-
-extras = dict()
-
-if sys.version_info >= (3,):
-    extras['use_2to3'] = True
-    extras['convert_2to3_doctests'] = ['src/your/module/README.txt']
-    #extra['use_2to3_fixers'] = ['your.fixers']
 
 setup(
     name='cave filter',
